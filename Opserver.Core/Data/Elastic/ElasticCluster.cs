@@ -1,60 +1,38 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Configuration;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
+using StackExchange.Profiling;
 
 namespace StackExchange.Opserver.Data.Elastic
 {
     public partial class ElasticCluster : PollNode, ISearchableNode, IMonitedService
     {
-        string ISearchableNode.DisplayName { get { return SettingsName; } }
-        string ISearchableNode.Name { get { return SettingsName; } }
-        string ISearchableNode.CategoryName { get { return "elastic"; } }
-        private string SettingsName { get; set; }
-        public List<ElasticNode> SettingsNodes { get; set; }
+        string ISearchableNode.Name => SettingsName;
+        string ISearchableNode.DisplayName => SettingsName;
+        private TimeSpan? _refreshInteval;
+        public TimeSpan RefreshInterval => _refreshInteval ?? (_refreshInteval = Settings.RefreshIntervalSeconds.Seconds()).Value;
+        string ISearchableNode.CategoryName => "elastic";
+        public ElasticSettings.Cluster Settings { get; }
+        private string SettingsName => Settings.Name;
 
         public ElasticCluster(ElasticSettings.Cluster cluster) : base(cluster.Name)
         {
-            SettingsName = cluster.Name;
-            SettingsNodes = cluster.Nodes.Select(n => new ElasticNode(n)).ToList();
+            Settings = cluster;
+            KnownNodes = cluster.Nodes.Select(n => new ElasticNode(n)).ToList();
         }
 
-        public class ElasticNode
-        {
-            public string Host { get; set; }
-            public int Port { get; set; }
+        public override string NodeType => "elastic";
+        public override int MinSecondsBetweenPolls => 5;
 
-            public ElasticNode(string hostAndPort)
-            {
-                var parts = hostAndPort.Split(StringSplits.Colon);
-                if (parts.Length == 2)
-                {
-                    Host = parts[0];
-                    int port;
-                    if (!int.TryParse(parts[1], out port))
-                    {
-                        Current.LogException(new ConfigurationErrorsException(string.Format("Invalid port specified for {0}: '{1}'", parts[0], parts[1])));
-                        Port = 9200;
-                    }
-                }
-                else
-                {
-                    Host = hostAndPort;
-                    Port = 9200;
-                }
-            }
-        }
-
-        public override string NodeType { get { return "elastic"; } }
-        public override int MinSecondsBetweenPolls { get { return 5; } }
         public override IEnumerable<Cache> DataPollers
         {
             get
             {
                 yield return Nodes;
-                yield return Stats;
-                yield return Status;
+                yield return IndexStats;
+                yield return State;
                 yield return HealthStatus;
                 yield return Aliases;
             }
@@ -62,14 +40,37 @@ namespace StackExchange.Opserver.Data.Elastic
 
         protected override IEnumerable<MonitorStatus> GetMonitorStatus()
         {
-            if (HealthStatus.Data != null && HealthStatus.Data.Indices != null)
-                yield return HealthStatus.Data.Indices.GetWorstStatus();
+            if (HealthStatus.Data?.Indexes != null)
+                yield return HealthStatus.Data.Indexes.Values.GetWorstStatus();
+            if (KnownNodes.All(n => n.LastException != null))
+                yield return MonitorStatus.Critical;
+            if (KnownNodes.Any(n => n.LastException != null))
+                yield return MonitorStatus.Warning;
+
+            yield return DataPollers.GetWorstStatus();
         }
+
         protected override string GetMonitorStatusReason()
         {
-            if (HealthStatus.Data != null && HealthStatus.Data.Indices != null)
-                return HealthStatus.Data.Indices.GetReasonSummary();
-            return null;
+            var reason = HealthStatus.Data?.Indexes?.Values.GetReasonSummary();
+            if (reason.HasValue()) return reason;
+
+            var sb = StringBuilderCache.Get();
+            foreach (var node in KnownNodes)
+            {
+                if (node.LastException != null)
+                {
+                    sb.Append(node.Name.IsNullOrEmptyReturn(node.Host))
+                        .Append(": ")
+                        .Append(node.LastException.Message)
+                        .Append("; ");
+                }
+            }
+
+            if (sb.Length > 2)
+                sb.Length -= 2;
+
+            return sb.ToStringRecycle();
         }
 
         // TODO: Poll down nodes faster?
@@ -81,36 +82,55 @@ namespace StackExchange.Opserver.Data.Elastic
         //                                        : ConfigSettings.DownRefreshIntervalSeconds;
         //}
 
-        private Cache<T> GetCache<T>(int seconds,
-                                     [CallerMemberName] string memberName = "",
-                                     [CallerFilePath] string sourceFilePath = "",
-                                     [CallerLineNumber] int sourceLineNumber = 0) where T : ElasticDataObject, new()
+        private Cache<T> GetElasticCache<T>(
+            Func<Task<T>> get,
+            [CallerMemberName] string memberName = "",
+            [CallerFilePath] string sourceFilePath = "",
+            [CallerLineNumber] int sourceLineNumber = 0
+            ) where T : class, new()
         {
-            return new Cache<T>(memberName, sourceFilePath, sourceLineNumber)
+            return new Cache<T>(this, "Elastic Fetch: " + SettingsName + ":" + typeof(T).Name,
+                RefreshInterval,
+                get,
+                addExceptionData: e => e.AddLoggedData("Cluster", SettingsName).AddLoggedData("Type", typeof(T).Name),
+                memberName: memberName,
+                sourceFilePath: sourceFilePath,
+                sourceLineNumber: sourceLineNumber
+            );
+        }
+
+        public async Task<T> GetAsync<T>(string path) where T : class
+        {
+            using (MiniProfiler.Current.CustomTiming("elastic", path))
+            {
+                foreach (var n in KnownNodes)
                 {
-                    CacheForSeconds = seconds,
-                    UpdateCache = UpdateFromElastic<T>()
-                };
+                    var result = await n.GetAsync<T>(path).ConfigureAwait(false);
+                    if (result != null)
+                    {
+                        return result;
+                    }
+                }
+            }
+
+            return null;
         }
 
-        public Action<Cache<T>> UpdateFromElastic<T>() where T : ElasticDataObject, new()
+        private static MonitorStatus ColorToStatus(string color)
         {
-            return UpdateCacheItem(description: "Elastic Fetch: " + SettingsName + ":" + typeof(T).Name,
-                                   getData: () =>
-                                       {
-                                           var result = new T();
-                                           result.PopulateFromConnections(SettingsNodes.Select(n => n.Host + ":" + n.Port));
-                                           return result;
-                                       },
-                                   addExceptionData:
-                                       e =>
-                                       e.AddLoggedData("Cluster", SettingsName)
-                                        .AddLoggedData("Type", typeof (T).Name));
+            switch (color)
+            {
+                case "green":
+                    return MonitorStatus.Good;
+                case "yellow":
+                    return MonitorStatus.Warning;
+                case "red":
+                    return MonitorStatus.Critical;
+                default:
+                    return MonitorStatus.Unknown;
+            }
         }
 
-        public override string ToString()
-        {
-            return SettingsName;
-        }
+        public override string ToString() => SettingsName;
     }
 }

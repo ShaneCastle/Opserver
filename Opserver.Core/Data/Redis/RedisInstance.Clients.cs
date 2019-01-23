@@ -1,22 +1,21 @@
 ﻿using System.Collections.Generic;
 using System.Linq;
-using BookSleeve;
+using StackExchange.Profiling;
+using StackExchange.Redis;
 
 namespace StackExchange.Opserver.Data.Redis
 {
     public partial class RedisInstance
     {
         private Cache<List<ClientInfo>> _clients;
-        public Cache<List<ClientInfo>> Clients
-        {
-            get
+        public Cache<List<ClientInfo>> Clients =>
+            _clients ?? (_clients = GetRedisCache(60.Seconds(), async () =>
             {
-                return _clients ?? (_clients = new Cache<List<ClientInfo>>
+                using (MiniProfiler.Current.CustomTiming("redis", "CLIENT LIST"))
                 {
-                    CacheForSeconds = 60,
-                    UpdateCache = GetFromRedis("Clients", rc => rc.Wait(rc.Server.ListClients()).ToList())
-                });
-            }
-        }
+                    var result = await Connection.GetSingleServer().ClientListAsync().ConfigureAwait(false);
+                    return result.ToList();
+                }
+            }));
     }
 }

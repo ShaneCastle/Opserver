@@ -2,61 +2,116 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
-using BookSleeve;
+using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
 using StackExchange.Opserver.Helpers;
 using StackExchange.Opserver.Data.Dashboard;
+using StackExchange.Redis;
 
 namespace StackExchange.Opserver.Data.Redis
 {
     public partial class RedisInstance : PollNode, IEquatable<RedisInstance>, ISearchableNode
     {
         // TODO: Per-Instance searchability, sub-nodes
-        string ISearchableNode.DisplayName { get { return Host + ":" + Port + " - " + Name; } }
-        string ISearchableNode.Name { get { return Host + ":" + Port; } }
-        string ISearchableNode.CategoryName { get { return "Redis"; } }
+        string ISearchableNode.DisplayName => HostAndPort + " - " + Name;
+        string ISearchableNode.Name => HostAndPort;
+        string ISearchableNode.CategoryName => "Redis";
 
         public RedisConnectionInfo ConnectionInfo { get; internal set; }
-        public string Name { get { return ConnectionInfo.Name; } }
-        public string Host { get { return ConnectionInfo.Host; } }
-        public int Port { get { return ConnectionInfo.Port; } }
+        public string Name => ConnectionInfo.Name;
+        public RedisHost Host => ConnectionInfo.Server;
+        public string ReplicationGroup => ConnectionInfo.Server.ReplicationGroupName;
+        public string ShortHost { get; internal set; }
+        public bool ReplicatesCrossRegion { get; }
 
-        public override string NodeType { get { return "Redis"; } }
-        public override int MinSecondsBetweenPolls { get { return 5; } }
+        public Version Version => Info.Data?.Server.Version;
+
+        public string Password => ConnectionInfo.Password;
+        public int Port => ConnectionInfo.Port;
+        public bool UseSsl => ConnectionInfo.Settings.UseSSL;
+
+        private string _hostAndPort;
+        public string HostAndPort => _hostAndPort ?? (_hostAndPort = Host + ":" + Port.ToString());
+
+        // Redis is spanish for WE LOVE DANGER, I think.
+        protected override TimeSpan BackoffDuration => TimeSpan.FromSeconds(5);
+
+        public override string NodeType => "Redis";
+        public override int MinSecondsBetweenPolls => 5;
+
+        private readonly object _connectionLock = new object();
+        private ConnectionMultiplexer _connection;
+        public ConnectionMultiplexer Connection
+        {
+            get
+            {
+                if (_connection == null || !_connection.IsConnected)
+                {
+                    _connection = _connection ?? GetConnection(allowAdmin: true);
+                    if (!_connection.IsConnected)
+                    {
+                        _connection.Configure();
+                    }
+                }
+                return _connection;
+            }
+        }
 
         public override IEnumerable<Cache> DataPollers
         {
             get
             {
+                yield return Config;
                 yield return Info;
                 yield return Clients;
+                yield return SlowLog;
+                yield return Tiebreaker;
             }
         }
 
         protected override IEnumerable<MonitorStatus> GetMonitorStatus()
         {
-            if (Role == RedisInfo.RedisInstanceRole.Unknown) yield return MonitorStatus.Critical;
+            // WE DON'T KNOW ANYTHING, k?
+            if (Info.PollsTotal == 0)
+            {
+                yield return MonitorStatus.Unknown;
+                yield break;
+            }
+            if (Role == RedisInfo.RedisInstanceRole.Unknown)
+            {
+                yield return Info.LastPollSuccessful ? MonitorStatus.Critical : MonitorStatus.Warning;
+            }
+            if (!Info.LastPollSuccessful) yield return MonitorStatus.Warning;
+            if (Replication == null)
+            {
+                yield return MonitorStatus.Unknown;
+                yield break;
+            }
             if (IsSlave && Replication.MasterLinkStatus != "up") yield return MonitorStatus.Warning;
             if (IsMaster && Replication.SlaveConnections.Any(s => s.Status != "online")) yield return MonitorStatus.Warning;
         }
+
         protected override string GetMonitorStatusReason()
         {
             if (Role == RedisInfo.RedisInstanceRole.Unknown) return "Unknown role";
+            if (Replication == null) return "Replication Unknown";
             if (IsSlave && Replication.MasterLinkStatus != "up") return "Master link down";
             if (IsMaster && Replication.SlaveConnections.Any(s => s.Status != "online")) return "Slave offline";
             return null;
         }
 
-        public RedisInstance(RedisConnectionInfo connectionInfo) : base(connectionInfo.Host + ":" + connectionInfo.Port)
+        public RedisInstance(RedisConnectionInfo connectionInfo) : base(connectionInfo.Host + ":" + connectionInfo.Port.ToString())
         {
             ConnectionInfo = connectionInfo;
+            ShortHost = connectionInfo.Host.Split(StringSplits.Period)[0];
+            ReplicatesCrossRegion = Current.Settings.Redis.Replication?.CrossRegionNameRegex?.IsMatch(ConnectionInfo.Name) ?? true;
         }
 
         public string GetServerName(string hostOrIp)
         {
-            IPAddress addr;
-            if (Current.Settings.Dashboard.Enabled && IPAddress.TryParse(hostOrIp, out addr))
+            if (Current.Settings.Dashboard.Enabled && IPAddress.TryParse(hostOrIp, out IPAddress addr))
             {
-                var nodes = DashboardData.GetNodesByIP(addr).ToList();
+                var nodes = DashboardModule.GetNodesByIP(addr).ToList();
                 if (nodes.Count == 1) return nodes[0].PrettyName;
             }
             //System.Net.Dns.GetHostEntry("10.7.0.46").HostName.Split(StringSplits.Period).First()
@@ -64,22 +119,47 @@ namespace StackExchange.Opserver.Data.Redis
             return AppCache.GetHostName(hostOrIp);
         }
 
-        public Action<Cache<T>> GetFromRedis<T>(string opName, Func<RedisConnection, T> getFromConnection) where T : class
+        // We're not doing a lot of redis access, so tone down the thread count to 1 socket queue handler
+        public static readonly SocketManager SharedSocketManager = new SocketManager("Opserver Shared");
+
+        private ConnectionMultiplexer GetConnection(bool allowAdmin = false, int syncTimeout = 60000)
         {
-            return UpdateCacheItem(description: "Redis Fetch: " + Name + ":" + opName,
-                                   getData: () =>
-                                       {
-                                           using (var rc = new RedisConnection(Host, Port, ioTimeout: 5000, syncTimeout: 5000, allowAdmin: true))
-                                           {
-                                               rc.Name = "Status";
-                                               rc.Wait(rc.Open());
-                                               return getFromConnection(rc);
-                                           }
-                                       },
-                                   logExceptions: false,
-                                   addExceptionData: e => e.AddLoggedData("Server", Name)
-                                                           .AddLoggedData("Host", Host)
-                                                           .AddLoggedData("Port", Port.ToString()));
+            var config = new ConfigurationOptions
+            {
+                SyncTimeout = syncTimeout,
+                ConnectTimeout = 60000,
+                AllowAdmin = allowAdmin,
+                Password = Password,
+                Ssl=UseSsl,
+                EndPoints =
+                {
+                    { ConnectionInfo.Host, ConnectionInfo.Port }
+                },
+                ClientName = "Opserver",
+                SocketManager = SharedSocketManager
+            };
+            return ConnectionMultiplexer.Connect(config);
+        }
+
+        private Cache<T> GetRedisCache<T>(
+            TimeSpan cacheDuration,
+            Func<Task<T>> get,
+            [CallerMemberName] string memberName = "",
+            [CallerFilePath] string sourceFilePath = "",
+            [CallerLineNumber] int sourceLineNumber = 0
+            ) where T : class
+        {
+            return new Cache<T>(this, "Redis Fetch: " + Name + ":" + memberName,
+                cacheDuration,
+                get,
+                addExceptionData: e => e.AddLoggedData("Server", Name)
+                                        .AddLoggedData("Host", ConnectionInfo.Host)
+                                        .AddLoggedData("Port", Port.ToString()),
+                timeoutMs: 10000,
+                memberName: memberName,
+                sourceFilePath: sourceFilePath,
+                sourceLineNumber: sourceLineNumber
+            );
         }
 
         public bool Equals(RedisInstance other)
@@ -88,22 +168,27 @@ namespace StackExchange.Opserver.Data.Redis
             return Host == other.Host && Port == other.Port;
         }
 
-        public override string ToString()
-        {
-            return string.Concat(Host, ": ", Port);
-        }
+        public override string ToString() => HostAndPort;
 
         public RedisMemoryAnalysis GetDatabaseMemoryAnalysis(int database, bool runIfMaster = false)
         {
+            var ci = ConnectionInfo;
             if (IsMaster && !runIfMaster)
             {
-                return new RedisMemoryAnalysis(ConnectionInfo, database)
+                // no slaves, and a master - boom
+                if (SlaveCount == 0)
+                {
+                    return new RedisMemoryAnalysis(ConnectionInfo, database)
                     {
                         ErrorMessage = "Cannot run memory analysis on a master - it hurts."
                     };
+                }
+
+                // Go to the first slave, automagically
+                ci = SlaveInstances[0].ConnectionInfo;
             }
 
-            return RedisAnalyzer.AnalyzeDatabaseMemory(ConnectionInfo, database);
+            return RedisAnalyzer.AnalyzeDatabaseMemory(ci, database);
         }
 
         public void ClearDatabaseMemoryAnalysisCache(int database)

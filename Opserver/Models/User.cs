@@ -7,40 +7,30 @@ namespace StackExchange.Opserver.Models
 {
     public class User : IPrincipal
     {
-        public IIdentity Identity { get; private set; }
+        public IIdentity Identity { get; }
 
-        public string AccountName { get; private set; }
-        public bool IsAnonymous { get; private set; }
+        public string AccountName { get; }
+        public bool IsAnonymous { get; }
 
         public User(IIdentity identity)
         {
             Identity = identity;
-            var i = identity as FormsIdentity;
-            if (i == null)
+            if (Identity == null)
             {
                 IsAnonymous = true;
                 return;
             }
 
-            IsAnonymous = !i.IsAuthenticated;
-            if (i.IsAuthenticated)
-                AccountName = i.Name;
+            IsAnonymous = !Identity.IsAuthenticated;
+            if (Identity.IsAuthenticated)
+                AccountName = Identity.Name;
         }
 
-        public bool IsInRole(string role)
-        {
-            Roles r;
-            return Enum.TryParse(role, out r) && IsInRole(r);
-        }
-
-        public bool IsInRole(Roles roles)
-        {
-            return (Role & roles) != Roles.None || Role.HasFlag(Roles.GlobalAdmin);
-        }
+        public bool IsInRole(string role) => Enum.TryParse(role, out Roles r) && Current.IsInRole(r);
 
         private Roles? _role;
-        public Roles? RawRoles { get { return _role; } }
-        
+        public Roles? RawRoles => _role;
+
         /// <summary>
         /// Returns this user's role on the current site.
         /// </summary>
@@ -60,33 +50,34 @@ namespace StackExchange.Opserver.Models
 
                         if (Current.Security.IsAdmin) result |= Roles.GlobalAdmin;
 
-                        if (Current.Settings.Dashboard.HasAccess()) result |= Roles.Dashboard;
-                        if (Current.Settings.Dashboard.IsAdmin()) result |= Roles.DashboardAdmin | Roles.Dashboard;
-
-                        if (Current.Settings.Exceptions.HasAccess()) result |= Roles.Exceptions;
-                        if (Current.Settings.Exceptions.IsAdmin()) result |= Roles.ExceptionsAdmin | Roles.Exceptions;
-
-                        if (Current.Settings.HAProxy.HasAccess()) result |= Roles.HAProxy;
-                        if (Current.Settings.HAProxy.IsAdmin()) result |= Roles.HAProxyAdmin | Roles.HAProxy;
-
-                        if (Current.Settings.SQL.HasAccess()) result |= Roles.SQL;
-                        if (Current.Settings.SQL.IsAdmin()) result |= Roles.SQLAdmin | Roles.SQL;
-
-                        if (Current.Settings.Elastic.HasAccess()) result |= Roles.Elastic;
-                        if (Current.Settings.Elastic.IsAdmin()) result |= Roles.ElasticAdmin | Roles.Elastic;
+                        result |= GetRoles(Current.Settings.CloudFlare, Roles.CloudFlare, Roles.CloudFlareAdmin);
+                        result |= GetRoles(Current.Settings.Dashboard, Roles.Dashboard, Roles.DashboardAdmin);
+                        result |= GetRoles(Current.Settings.Elastic, Roles.Elastic, Roles.ElasticAdmin);
+                        result |= GetRoles(Current.Settings.Exceptions, Roles.Exceptions, Roles.ExceptionsAdmin);
+                        result |= GetRoles(Current.Settings.HAProxy, Roles.HAProxy, Roles.HAProxyAdmin);
+                        result |= GetRoles(Current.Settings.Redis, Roles.Redis, Roles.RedisAdmin);
+                        result |= GetRoles(Current.Settings.SQL, Roles.SQL, Roles.SQLAdmin);
+                        result |= GetRoles(Current.Settings.PagerDuty, Roles.PagerDuty, Roles.PagerDutyAdmin);
 
                         _role = result;
                     }
                 }
-                return Current.Security.IsInternalIP(Current.RequestIP)
-                           ? _role.Value | Roles.InternalRequest
-                           : _role.Value;
+
+                return _role.Value;
             }
         }
 
-        public bool IsGlobalAdmin { get { return IsInRole(Roles.GlobalAdmin); } }
-        public bool IsExceptionAdmin { get { return IsInRole(Roles.ExceptionsAdmin); } }
-        public bool IsHAProxyAdmin { get { return IsInRole(Roles.ExceptionsAdmin); } }
-        public bool IsSQLAdmin { get { return IsInRole(Roles.SQLAdmin); } }
+        public Roles GetRoles(ISecurableModule module, Roles user, Roles admin)
+        {
+            if (module.IsAdmin()) return admin | user;
+            if (module.HasAccess()) return user;
+            return Roles.None;
+        }
+
+        public bool IsGlobalAdmin => Current.IsInRole(Roles.GlobalAdmin);
+        public bool IsExceptionAdmin => Current.IsInRole(Roles.ExceptionsAdmin);
+        public bool IsHAProxyAdmin => Current.IsInRole(Roles.ExceptionsAdmin);
+        public bool IsRedisAdmin => Current.IsInRole(Roles.RedisAdmin);
+        public bool IsSQLAdmin => Current.IsInRole(Roles.SQLAdmin);
     }
 }

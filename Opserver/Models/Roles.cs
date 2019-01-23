@@ -27,8 +27,16 @@ namespace StackExchange.Opserver.Models
         Dashboard = 1 << 13,
         DashboardAdmin = 1 << 14,
 
-        InternalRequest = 1 << 19,
+        CloudFlare = 1 << 15,
+        CloudFlareAdmin = 1 << 16,
 
-        GlobalAdmin = 1 << 20
+        PagerDuty = 1 << 17,
+        PagerDutyAdmin = 1 << 18,
+
+        LocalRequest = 1 << 19,
+        InternalRequest = 1 << 20,
+        ApiRequest = 1 << 21,
+
+        GlobalAdmin = 1 << 22
     }
 }
